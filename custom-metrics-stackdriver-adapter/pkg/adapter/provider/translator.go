@@ -68,7 +68,7 @@ type Translator struct {
 // podList is required to be no longer than oneOfMax items. This is enforced by limitation of
 // "one_of()" operator in Stackdriver filters, see documentation:
 // https://cloud.google.com/monitoring/api/v3/filters
-func (t *Translator) GetSDReqForPods(podList *v1.PodList, metricName string, metricKind, namespace string) (*stackdriver.ProjectsTimeSeriesListCall, error) {
+func (t *Translator) GetSDReqForPods(podList *v1.PodList, metricName string, metricKind, valueType, namespace string) (*stackdriver.ProjectsTimeSeriesListCall, error) {
 	if len(podList.Items) == 0 {
 		return nil, apierr.NewBadRequest("No objects matched provided selector")
 	}
@@ -90,14 +90,14 @@ func (t *Translator) GetSDReqForPods(podList *v1.PodList, metricName string, met
 			t.legacyFilterForCluster(),
 			t.legacyFilterForPods(resourceIDs))
 	}
-	return t.createListTimeseriesRequest(filter, metricKind), nil
+	return t.createListTimeseriesRequest(filter, metricKind, valueType), nil
 }
 
 // GetSDReqForNodes returns Stackdriver request for query for multiple nodes.
 // nodeList is required to be no longer than oneOfMax items. This is enforced by limitation of
 // "one_of()" operator in Stackdriver filters, see documentation:
 // https://cloud.google.com/monitoring/api/v3/filters
-func (t *Translator) GetSDReqForNodes(nodeList *v1.NodeList, metricName string, metricKind string) (*stackdriver.ProjectsTimeSeriesListCall, error) {
+func (t *Translator) GetSDReqForNodes(nodeList *v1.NodeList, metricName string, metricKind string, valueType string) (*stackdriver.ProjectsTimeSeriesListCall, error) {
 	if len(nodeList.Items) == 0 {
 		return nil, apierr.NewBadRequest("No objects matched provided selector")
 	}
@@ -114,11 +114,11 @@ func (t *Translator) GetSDReqForNodes(nodeList *v1.NodeList, metricName string, 
 		t.filterForCluster(),
 		t.filterForNodes(resourceNames),
 		t.filterForAnyNode())
-	return t.createListTimeseriesRequest(filter, metricKind), nil
+	return t.createListTimeseriesRequest(filter, metricKind, valueType), nil
 }
 
 // GetExternalMetricRequest returns Stackdriver request for query for external metric.
-func (t *Translator) GetExternalMetricRequest(metricName string, metricKind string, metricSelector labels.Selector) (*stackdriver.ProjectsTimeSeriesListCall, error) {
+func (t *Translator) GetExternalMetricRequest(metricName string, metricKind string, valueType string, metricSelector labels.Selector) (*stackdriver.ProjectsTimeSeriesListCall, error) {
 	metricProject, err := t.GetExternalMetricProject(metricSelector)
 	if err != nil {
 		return nil, err
@@ -126,13 +126,13 @@ func (t *Translator) GetExternalMetricRequest(metricName string, metricKind stri
 
 	filterForMetric := t.filterForMetric(metricName)
 	if metricSelector.Empty() {
-		return t.createListTimeseriesRequest(filterForMetric, metricKind), nil
+		return t.createListTimeseriesRequest(filterForMetric, metricKind, valueType), nil
 	}
 	filterForSelector, err := t.filterForSelector(metricSelector)
 	if err != nil {
 		return nil, err
 	}
-	return t.createListTimeseriesRequestProject(joinFilters(filterForMetric, filterForSelector), metricKind, metricProject), nil
+	return t.createListTimeseriesRequestProject(joinFilters(filterForMetric, filterForSelector), metricKind, valueType, metricProject), nil
 }
 
 // GetRespForSingleObject returns translates Stackdriver response to a Custom Metric associated with
@@ -241,6 +241,15 @@ func (t *Translator) GetMetricKind(metricName string) (string, error) {
 		return "", provider.NewNoSuchMetricError(metricName, err)
 	}
 	return response.MetricKind, nil
+}
+
+// GetValueType returns valueType for metric metricName, obtained from Stackdriver Monitoring API.
+func (t *Translator) GetValueType(metricName string) (string, error) {
+	response, err := t.service.Projects.MetricDescriptors.Get(fmt.Sprintf("projects/%s/metricDescriptors/%s", t.config.Project, metricName)).Do()
+	if err != nil {
+		return "", provider.NewNoSuchMetricError(metricName, err)
+	}
+	return response.ValueType, nil
 }
 
 // GetExternalMetricProject If the metric has "resource.labels.project_id" as a selector, then use a different project
@@ -459,11 +468,11 @@ func (t *Translator) getMetricLabels(series *stackdriver.TimeSeries) map[string]
 	return metricLabels
 }
 
-func (t *Translator) createListTimeseriesRequest(filter string, metricKind string) *stackdriver.ProjectsTimeSeriesListCall {
-	return t.createListTimeseriesRequestProject(filter, metricKind, t.config.Project)
+func (t *Translator) createListTimeseriesRequest(filter string, metricKind string, valueType string) *stackdriver.ProjectsTimeSeriesListCall {
+	return t.createListTimeseriesRequestProject(filter, metricKind, valueType, t.config.Project)
 }
 
-func (t *Translator) createListTimeseriesRequestProject(filter string, metricKind string, metricProject string) *stackdriver.ProjectsTimeSeriesListCall {
+func (t *Translator) createListTimeseriesRequestProject(filter string, metricKind string, valueType string, metricProject string) *stackdriver.ProjectsTimeSeriesListCall {
 	project := fmt.Sprintf("projects/%s", metricProject)
 	endTime := t.clock.Now()
 	startTime := endTime.Add(-t.reqWindow)
@@ -471,8 +480,19 @@ func (t *Translator) createListTimeseriesRequestProject(filter string, metricKin
 	aligner := "ALIGN_NEXT_OLDER"
 	alignmentPeriod := t.reqWindow
 	if metricKind == "DELTA" || metricKind == "CUMULATIVE" {
-		aligner = "ALIGN_RATE"
 		alignmentPeriod = t.alignmentPeriod
+		// Use ALIGN_DELTA as an only match aligner for type "DISTRIBUTION"
+		if valueType == "DISTRIBUTION" {
+			aligner = "ALIGN_DELTA"
+			return t.service.Projects.TimeSeries.List(project).Filter(filter).
+				IntervalStartTime(startTime.Format(time.RFC3339)).
+				IntervalEndTime(endTime.Format(time.RFC3339)).
+				AggregationPerSeriesAligner(aligner).
+				AggregationCrossSeriesReducer("REDUCE_MEAN").
+				AggregationAlignmentPeriod(fmt.Sprintf("%vs", int64(alignmentPeriod.Seconds())))
+		} else {
+			aligner = "ALIGN_RATE"
+		}
 	}
 	return t.service.Projects.TimeSeries.List(project).Filter(filter).
 		IntervalStartTime(startTime.Format(time.RFC3339)).
